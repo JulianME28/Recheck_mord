@@ -1,6 +1,6 @@
 /**
  * Warranty recheck automation for Google Sheets.
- * Paste this file into Extensions -> Apps Script and run setupWarrantyAutomation() once.
+ * Paste this file into Extensions -> Apps Script and run WR_setupWarrantyAutomation_v1() once.
  */
 
 const WR_WarrantyRecheckAutomation_v1 = (() => {
@@ -15,7 +15,8 @@ const WARRANTY_CFG = Object.freeze({
     deadline: ['Дедлайн', 'Deadline'],
     mainComment: ['Коментар Аня'],
     endDate: ['End data', 'End date'],
-    number: ['№', 'No', 'Номер']
+    number: ['№', 'No', 'Номер'],
+    warrantyNumber: ['№', 'No', 'Номер', 'l']
   },
   eligibleMainStatuses: ['прийнято', 'перевірено'],
   needsReplacementStatus: 'Потрібно зробити заміни',
@@ -29,6 +30,11 @@ const WARRANTY_CFG = Object.freeze({
   },
   logSheet: '_Warranty log'
 });
+
+const WARRANTY_MONTH_NAMES = Object.freeze([
+  'січень', 'лютий', 'березень', 'квітень', 'травень', 'червень',
+  'липень', 'серпень', 'вересень', 'жовтень', 'листопад', 'грудень'
+]);
 
 function setup() {
   const ss = SpreadsheetApp.getActive();
@@ -47,8 +53,9 @@ function runDailyTransfer() {
   withDocumentLock_(() => {
     const ss = SpreadsheetApp.getActive();
     const today = startOfDay_(new Date(), ss.getSpreadsheetTimeZone());
-    const mainSheets = ss.getSheets().filter(s => parseSheetMonth_(s.getName(), 'main'));
-    mainSheets.forEach(main => transferEligibleRows_(ss, main, today));
+    const mainSheets = activeMainSheets_(ss, ss.getSpreadsheetTimeZone());
+    const warrantyContexts = Object.create(null);
+    mainSheets.forEach(main => transferEligibleRows_(ss, main, today, warrantyContexts));
   });
 }
 
@@ -71,29 +78,22 @@ function installedOnEdit(e) {
   }
 }
 
-function transferEligibleRows_(ss, main, today) {
-  const suffix = parseSheetMonth_(main.getName(), 'main');
-  const warranty = findMonthSheet_(ss, 'warranty', suffix);
-  if (!warranty) {
-    log_(ss, 'ERROR', main.getName(), '', 'Немає гарантійного листа для місяця: ' + suffix);
-    return;
-  }
-
+function transferEligibleRows_(ss, main, today, warrantyContexts) {
   const sourceMap = headerMap_(main);
-  const destMap = headerMap_(warranty);
   const briefCol = requiredColumn_(sourceMap, WARRANTY_CFG.headers.brief, main.getName());
   const checkCol = requiredColumn_(sourceMap, WARRANTY_CFG.headers.check, main.getName());
   const deadlineCol = requiredColumn_(sourceMap, WARRANTY_CFG.headers.deadline, main.getName());
-  const destBriefCol = requiredColumn_(destMap, WARRANTY_CFG.headers.brief, warranty.getName());
-  const destCheckCol = requiredColumn_(destMap, WARRANTY_CFG.headers.check, warranty.getName());
-  const endDateCol = requiredColumn_(destMap, WARRANTY_CFG.headers.endDate, warranty.getName());
+  const numberCol = requiredColumn_(sourceMap, WARRANTY_CFG.headers.number, main.getName());
+  const mainCommentCol = requiredColumn_(sourceMap, WARRANTY_CFG.headers.mainComment, main.getName());
   const lastRow = main.getLastRow();
   if (lastRow <= WARRANTY_CFG.headerRow) return;
 
   const count = lastRow - WARRANTY_CFG.headerRow;
   const deadlines = main.getRange(WARRANTY_CFG.headerRow + 1, deadlineCol, count, 1).getValues();
   const statuses = main.getRange(WARRANTY_CFG.headerRow + 1, checkCol, count, 1).getDisplayValues();
-  const existingKeys = collectKeys_(warranty, destBriefCol);
+  const projectNumbers = main.getRange(WARRANTY_CFG.headerRow + 1, numberCol, count, 1).getDisplayValues();
+  const briefKeys = briefKeysFromRange_(main.getRange(WARRANTY_CFG.headerRow + 1, briefCol, count, 1));
+  const candidates = [];
 
   for (let i = 0; i < count; i++) {
     const row = WARRANTY_CFG.headerRow + 1 + i;
@@ -103,22 +103,51 @@ function transferEligibleRows_(ss, main, today) {
     if (today.getTime() < due.getTime()) continue;
     if (!WARRANTY_CFG.eligibleMainStatuses.includes(norm_(statuses[i][0]))) continue;
 
-    const key = briefKeyFromCell_(main.getRange(row, briefCol));
+    const projectNumber = String(projectNumbers[i][0] == null ? '' : projectNumbers[i][0]).trim();
+    if (!projectNumber) {
+      log_(ss, 'SKIP', main.getName(), row, 'Порожній номер проєкту');
+      continue;
+    }
+    // Номер із цифровим суфіксом /1, /2, ... означає частину батьківського проєкту.
+    if (isSubprojectNumber_(projectNumber)) continue;
+
+    const key = briefKeys[i];
     if (!key) {
       log_(ss, 'SKIP', main.getName(), row, 'Порожнє або нерозпізнане ТЗ замовника');
       continue;
     }
-    if (existingKeys.has(key)) continue;
-
-    const destRow = Math.max(warranty.getLastRow() + 1, WARRANTY_CFG.headerRow + 1);
-    copyMappedRow_(main, row, sourceMap, warranty, destRow, destMap);
-    const statusCell = warranty.getRange(destRow, destCheckCol);
-    ensureListValidationValues_(statusCell, [WARRANTY_CFG.needsReplacementStatus, WARRANTY_CFG.readyStatus]);
-    statusCell.setValue(WARRANTY_CFG.needsReplacementStatus);
-    warranty.getRange(destRow, endDateCol).setValue(addDays_(today, WARRANTY_CFG.replacementDays)).setNumberFormat('dd.MM.yyyy');
-    existingKeys.add(key);
-    log_(ss, 'TRANSFER', main.getName(), row, 'Перенесено в ' + warranty.getName() + ', рядок ' + destRow);
+    candidates.push({
+      row,
+      key,
+      deadline,
+      due,
+      projectNumber,
+      targetMonth: monthNameFromDate_(deadline, ss.getSpreadsheetTimeZone())
+    });
   }
+
+  candidates.forEach(candidate => {
+    try {
+      const context = warrantyContext_(ss, candidate.targetMonth, warrantyContexts);
+      if (context.existingKeys.has(candidate.key)) return;
+
+      const destRow = context.nextRow;
+      copyMappedRow_(main, candidate.row, sourceMap, context.sheet, destRow, context.destMap, [
+        { sourceCol: numberCol, destCol: context.destNumberCol },
+        { sourceCol: mainCommentCol, destCol: context.destMainCommentCol }
+      ]);
+      const statusCell = context.sheet.getRange(destRow, context.destCheckCol);
+      ensureListValidationValues_(statusCell, [WARRANTY_CFG.needsReplacementStatus, WARRANTY_CFG.readyStatus]);
+      statusCell.setValue(WARRANTY_CFG.needsReplacementStatus);
+      const endDate = addDays_(candidate.due, WARRANTY_CFG.replacementDays);
+      context.sheet.getRange(destRow, context.endDateCol).setValue(endDate).setNumberFormat('dd.MM.yyyy');
+      context.existingKeys.add(candidate.key);
+      context.nextRow = destRow + 1;
+      log_(ss, 'TRANSFER', main.getName(), candidate.row, 'Перенесено в ' + context.sheet.getName() + ', рядок ' + destRow);
+    } catch (err) {
+      log_(ss, 'ERROR', main.getName(), candidate.row, err.stack || err.message);
+    }
+  });
 }
 
 function finishWarrantyRow_(ss, warranty, row) {
@@ -129,20 +158,17 @@ function finishWarrantyRow_(ss, warranty, row) {
   const url = urlFromCell_(briefCell);
   if (!key || !url) throw new Error('У рядку ' + row + ' не знайдено URL у колонці ТЗ замовника.');
 
-  const suffix = parseSheetMonth_(warranty.getName(), 'warranty');
-  const main = findMonthSheet_(ss, 'main', suffix);
-  if (!main) throw new Error('Не знайдено основний лист для місяця: ' + suffix);
-  const mainMap = headerMap_(main);
-  const mainBriefCol = requiredColumn_(mainMap, WARRANTY_CFG.headers.brief, main.getName());
-  const mainCheckCol = requiredColumn_(mainMap, WARRANTY_CFG.headers.check, main.getName());
-  const matches = findRowsByKey_(main, mainBriefCol, key);
+  const matches = findMainRowsByKey_(ss, key);
   if (matches.length !== 1) {
-    throw new Error('Для ТЗ знайдено ' + matches.length + ' рядків у ' + main.getName() + '; статус не змінено, щоб не зачепити неправильний рядок.');
+    throw new Error('Для ТЗ знайдено ' + matches.length + ' рядків у основних листах; статус не змінено, щоб не зачепити неправильний рядок.');
   }
 
   stampExternalBrief_(url, startOfDay_(new Date(), ss.getSpreadsheetTimeZone()));
-  main.getRange(matches[0], mainCheckCol).setValue(WARRANTY_CFG.readyStatus);
-  log_(ss, 'READY', warranty.getName(), row, 'ТЗ оновлено; статус синхронізовано з ' + main.getName());
+  const match = matches[0];
+  const mainMap = headerMap_(match.sheet);
+  const mainCheckCol = requiredColumn_(mainMap, WARRANTY_CFG.headers.check, match.sheet.getName());
+  match.sheet.getRange(match.row, mainCheckCol).setValue(WARRANTY_CFG.readyStatus);
+  log_(ss, 'READY', warranty.getName(), row, 'ТЗ оновлено; статус синхронізовано з ' + match.sheet.getName());
 }
 
 function stampExternalBrief_(url, date) {
@@ -170,14 +196,31 @@ function stampExternalBrief_(url, date) {
   dateRange.setValues(output).setNumberFormat('dd.MM.yyyy');
 }
 
-function copyMappedRow_(src, srcRow, srcMap, dst, dstRow, dstMap) {
+function copyMappedRow_(src, srcRow, srcMap, dst, dstRow, dstMap, explicitMappings) {
+  const mappings = explicitMappings || [];
+  const explicitDestCols = new Set(mappings.map(m => m.destCol));
+  const copyPlan = [];
   Object.keys(dstMap).forEach(headerKey => {
     const dstCol = dstMap[headerKey];
-    let srcCol = srcMap[headerKey];
-    if (!srcCol && isAlias_(headerKey, WARRANTY_CFG.headers.endDate)) {
-      srcCol = optionalColumn_(srcMap, WARRANTY_CFG.headers.mainComment);
+    if (explicitDestCols.has(dstCol) || isAlias_(headerKey, WARRANTY_CFG.headers.endDate)) return;
+    const srcCol = srcMap[headerKey];
+    if (srcCol) copyPlan.push({ sourceCol: srcCol, destCol: dstCol });
+  });
+  mappings.forEach(m => copyPlan.push(m));
+  copyPlan.sort((a, b) => a.destCol - b.destCol);
+
+  const groups = [];
+  copyPlan.forEach(m => {
+    const last = groups[groups.length - 1];
+    if (last && m.sourceCol === last.sourceCol + last.width && m.destCol === last.destCol + last.width) {
+      last.width++;
+    } else {
+      groups.push({ sourceCol: m.sourceCol, destCol: m.destCol, width: 1 });
     }
-    if (srcCol) src.getRange(srcRow, srcCol).copyTo(dst.getRange(dstRow, dstCol), SpreadsheetApp.CopyPasteType.PASTE_NORMAL, false);
+  });
+  groups.forEach(g => {
+    src.getRange(srcRow, g.sourceCol, 1, g.width)
+      .copyTo(dst.getRange(dstRow, g.destCol, 1, g.width), SpreadsheetApp.CopyPasteType.PASTE_NORMAL, false);
   });
   dst.setRowHeight(dstRow, src.getRowHeight(srcRow));
 }
@@ -209,19 +252,31 @@ function isAlias_(normalizedHeader, aliases) {
 
 function collectKeys_(sheet, col) {
   const set = new Set();
-  for (let row = WARRANTY_CFG.headerRow + 1; row <= sheet.getLastRow(); row++) {
-    const key = briefKeyFromCell_(sheet.getRange(row, col));
-    if (key) set.add(key);
-  }
+  const count = sheet.getLastRow() - WARRANTY_CFG.headerRow;
+  if (count <= 0) return set;
+  briefKeysFromRange_(sheet.getRange(WARRANTY_CFG.headerRow + 1, col, count, 1))
+    .forEach(key => { if (key) set.add(key); });
   return set;
 }
 
 function findRowsByKey_(sheet, col, key) {
   const rows = [];
-  for (let row = WARRANTY_CFG.headerRow + 1; row <= sheet.getLastRow(); row++) {
-    if (briefKeyFromCell_(sheet.getRange(row, col)) === key) rows.push(row);
-  }
+  const count = sheet.getLastRow() - WARRANTY_CFG.headerRow;
+  if (count <= 0) return rows;
+  briefKeysFromRange_(sheet.getRange(WARRANTY_CFG.headerRow + 1, col, count, 1))
+    .forEach((candidate, i) => {
+      if (candidate === key) rows.push(WARRANTY_CFG.headerRow + 1 + i);
+    });
   return rows;
+}
+
+function briefKeysFromRange_(range) {
+  const richValues = range.getRichTextValues();
+  const formulas = range.getFormulas();
+  const displayValues = range.getDisplayValues();
+  return displayValues.map((row, i) => normalizeUrl_(
+    urlFromParts_(richValues[i][0], formulas[i][0], row[0]) || row[0]
+  ));
 }
 
 function briefKeyFromCell_(cell) {
@@ -230,15 +285,17 @@ function briefKeyFromCell_(cell) {
 }
 
 function urlFromCell_(cell) {
-  const rich = cell.getRichTextValue();
+  return urlFromParts_(cell.getRichTextValue(), cell.getFormula(), cell.getDisplayValue());
+}
+
+function urlFromParts_(rich, formula, displayValue) {
   if (rich) {
     if (rich.getLinkUrl()) return rich.getLinkUrl();
     for (const run of rich.getRuns()) if (run.getLinkUrl()) return run.getLinkUrl();
   }
-  const formula = cell.getFormula();
   const mFormula = formula && formula.match(/^=HYPERLINK\(\s*[\"']([^\"']+)/i);
   if (mFormula) return mFormula[1];
-  const mText = String(cell.getDisplayValue()).match(/https?:\/\/[^\s]+/i);
+  const mText = String(displayValue || '').match(/https?:\/\/[^\s]+/i);
   return mText ? mText[0] : '';
 }
 
@@ -258,6 +315,115 @@ function parseSheetMonth_(name, kind) {
 function findMonthSheet_(ss, kind, month) {
   const wanted = norm_(month);
   return ss.getSheets().find(s => norm_(parseSheetMonth_(s.getName(), kind)) === wanted) || null;
+}
+
+function warrantyContext_(ss, month, contexts) {
+  const key = norm_(month);
+  if (contexts[key]) return contexts[key];
+
+  const sheet = ensureWarrantySheet_(ss, month);
+  const destMap = headerMap_(sheet);
+  const context = {
+    sheet,
+    destMap,
+    destBriefCol: requiredColumn_(destMap, WARRANTY_CFG.headers.brief, sheet.getName()),
+    destCheckCol: requiredColumn_(destMap, WARRANTY_CFG.headers.check, sheet.getName()),
+    endDateCol: requiredColumn_(destMap, WARRANTY_CFG.headers.endDate, sheet.getName()),
+    destNumberCol: requiredColumn_(destMap, WARRANTY_CFG.headers.warrantyNumber, sheet.getName()),
+    destMainCommentCol: requiredColumn_(destMap, WARRANTY_CFG.headers.mainComment, sheet.getName()),
+    existingKeys: null,
+    nextRow: Math.max(sheet.getLastRow() + 1, WARRANTY_CFG.headerRow + 1)
+  };
+  context.existingKeys = collectKeys_(sheet, context.destBriefCol);
+  contexts[key] = context;
+  return context;
+}
+
+function ensureWarrantySheet_(ss, month) {
+  const existing = findMonthSheet_(ss, 'warranty', month);
+  if (existing) return existing;
+
+  const template = findWarrantyTemplateSheet_(ss, month);
+  if (!template) {
+    throw new Error('Не знайдено лист-шаблон для створення перечеку: ' + month);
+  }
+
+  const name = WARRANTY_CFG.warrantyPrefix + ' - ' + monthLabel_(month);
+  const created = template.copyTo(ss);
+  created.setName(name);
+  created.showSheet();
+  clearWarrantyData_(created);
+  log_(ss, 'SHEET_CREATE', created.getName(), '', 'Створено автоматично з шаблону ' + template.getName());
+  return created;
+}
+
+function findWarrantyTemplateSheet_(ss, targetMonth) {
+  const sheets = ss.getSheets().filter(s => parseSheetMonth_(s.getName(), 'warranty'));
+  if (!sheets.length) return null;
+
+  const targetNumber = monthNumber_(targetMonth);
+  if (targetNumber) {
+    const previous = sheets
+      .filter(s => {
+        const number = monthNumber_(parseSheetMonth_(s.getName(), 'warranty'));
+        return number && number <= targetNumber;
+      })
+      .sort((a, b) => monthNumber_(parseSheetMonth_(a.getName(), 'warranty')) - monthNumber_(parseSheetMonth_(b.getName(), 'warranty')) || a.getIndex() - b.getIndex());
+    if (previous.length) return previous[previous.length - 1];
+  }
+  return sheets[sheets.length - 1];
+}
+
+function clearWarrantyData_(sheet) {
+  const rowCount = Math.max(sheet.getLastRow() - WARRANTY_CFG.headerRow, 1);
+  const dataRange = sheet.getRange(WARRANTY_CFG.headerRow + 1, 1, rowCount, Math.max(sheet.getMaxColumns(), 1));
+  dataRange.clearContent();
+  dataRange.clearNote();
+}
+
+function activeMainSheets_(ss, tz) {
+  const currentMonth = Number(Utilities.formatDate(new Date(), tz, 'M'));
+  return ss.getSheets()
+    .filter(s => parseSheetMonth_(s.getName(), 'main') && !s.isSheetHidden())
+    .sort((a, b) => {
+      const aMonth = monthNumber_(parseSheetMonth_(a.getName(), 'main'));
+      const bMonth = monthNumber_(parseSheetMonth_(b.getName(), 'main'));
+      return relativeMonthDistance_(aMonth, currentMonth) - relativeMonthDistance_(bMonth, currentMonth) || a.getIndex() - b.getIndex();
+    });
+}
+
+function relativeMonthDistance_(month, currentMonth) {
+  if (!month || !currentMonth) return 99;
+  let distance = month - currentMonth;
+  while (distance > 6) distance -= 12;
+  while (distance < -6) distance += 12;
+  return distance;
+}
+
+function findMainRowsByKey_(ss, key) {
+  const matches = [];
+  ss.getSheets().filter(s => parseSheetMonth_(s.getName(), 'main')).forEach(main => {
+    const map = headerMap_(main);
+    const briefCol = optionalColumn_(map, WARRANTY_CFG.headers.brief);
+    if (!briefCol) return;
+    findRowsByKey_(main, briefCol, key).forEach(row => matches.push({ sheet: main, row }));
+  });
+  return matches;
+}
+
+function monthNameFromDate_(date, tz) {
+  const month = Number(Utilities.formatDate(new Date(date), tz, 'M'));
+  return WARRANTY_MONTH_NAMES[month - 1] || '';
+}
+
+function monthLabel_(month) {
+  const value = norm_(month);
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : '';
+}
+
+function monthNumber_(month) {
+  const index = WARRANTY_MONTH_NAMES.indexOf(norm_(month));
+  return index < 0 ? 0 : index + 1;
 }
 
 function isGreen_(hex) {
@@ -281,6 +447,7 @@ function ensureListValidationValues_(cell, requiredValues) {
 }
 
 function norm_(v) { return String(v == null ? '' : v).trim().toLowerCase().replace(/\s+/g, ' '); }
+function isSubprojectNumber_(v) { return /\/\s*\d+\s*$/.test(String(v == null ? '' : v).trim()); }
 function asDate_(v) { const d = v instanceof Date ? new Date(v) : new Date(v); return isNaN(d.getTime()) ? null : d; }
 function addDays_(d, days) { const out = new Date(d); out.setDate(out.getDate() + days); return out; }
 function startOfDay_(d, tz) {
